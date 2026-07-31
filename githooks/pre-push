@@ -1,0 +1,88 @@
+#!/usr/bin/env bash
+# Gate: "no fresh green e2e → don't push to the mainline".
+#
+# This is the ONE reproducible gate in the kit: it is versioned in git and works on any clone
+# (unlike editor/agent hooks, which are per-machine). Enable it once:
+#   git config core.hooksPath githooks       # or your hooks dir
+#
+# It gates a push to the mainline branch AND a push of any branch that touches the guarded
+# source paths (those branches almost always land on the mainline via a server-side merge that
+# local hooks can't see — so this push is the only interception point). Other branches
+# (docs/config only) are free.
+#
+# Source of truth for "green" is the marker test-results/e2e-pass.json, written ONLY by a
+# successful run of scripts/regression/run-all.sh (make e2e-all / /e2e-full). The marker is
+# valid iff:  sha == current HEAD  AND  the required phases are all in pass[].
+# So an echo-forged marker won't pass: it needs a real list of passed phases under HEAD.
+#
+# Emergency bypass (infrastructure is down, NOT a test failure):
+#   SKIP_E2E_GATE=1 git push ...
+#
+# Config (override via env or regression.config.sh at repo root):
+#   MAINLINE_BRANCH   default: main
+#   REQUIRED_PHASES   default: "golden integration ledger"
+#   GATED_PATHS       default: "src/"   (regex-anchored prefix; branches touching it are gated)
+set -uo pipefail
+
+repo_root="$(git rev-parse --show-toplevel 2>/dev/null || echo .)"
+[ -f "$repo_root/regression.config.sh" ] && . "$repo_root/regression.config.sh"
+marker="$repo_root/test-results/e2e-pass.json"
+mainline="${MAINLINE_BRANCH:-main}"
+required="${REQUIRED_PHASES:-golden integration ledger}"
+gated_paths="${GATED_PATHS:-src/}"
+
+# Gating decision. stdin: <local ref> <local oid> <remote ref> <remote oid>
+gated=0
+while read -r _localref localoid remoteref _remoteoid; do
+  case "$remoteref" in
+    "refs/heads/$mainline") gated=1 ;;
+    refs/heads/*)
+      # Feature branch: gate if its commits (vs origin/mainline) touch the guarded paths.
+      # origin/mainline may lag — best-effort; if no base is found, don't gate.
+      base="$(git merge-base "origin/$mainline" "${localoid}" 2>/dev/null || echo)"
+      if [ -n "$base" ] && \
+         git diff --name-only "$base" "${localoid}" 2>/dev/null | grep -qE "^${gated_paths}"; then
+        gated=1
+      fi
+      ;;
+  esac
+done
+
+[ "$gated" = 1 ] || exit 0   # not mainline, no guarded-path changes — not our business
+
+if [ "${SKIP_E2E_GATE:-0}" = 1 ]; then
+  echo "⚠ pre-push: e2e gate SKIPPED via SKIP_E2E_GATE=1 (justify it in the MR)." >&2
+  exit 0
+fi
+
+head_sha="$(git rev-parse HEAD 2>/dev/null || echo unknown)"
+
+block() {
+  echo "════════ pre-push BLOCKED: push (mainline / guarded paths) without fresh e2e ════════" >&2
+  echo "Reason: $1" >&2
+  echo "Fix: run /e2e-full (or scripts/regression/run-all.sh) — the marker is written on green," >&2
+  echo "     then push again. If INFRASTRUCTURE failed (not a test) — SKIP_E2E_GATE=1 git push ..." >&2
+  exit 1
+}
+
+[ -f "$marker" ] || block "no marker test-results/e2e-pass.json (e2e was not run for HEAD)."
+
+# Parse the marker with python3 (jq may be absent on a clean machine).
+python3 - "$marker" "$head_sha" "$required" <<'PY' || block "marker invalid for this HEAD (stale / wrong phases). Re-run e2e."
+import json, sys
+marker, head, required = sys.argv[1], sys.argv[2], sys.argv[3].split()
+try:
+    d = json.load(open(marker))
+except Exception as e:
+    print(f"marker unreadable: {e}", file=sys.stderr); sys.exit(1)
+if d.get("sha") != head:
+    print(f"marker sha {str(d.get('sha'))[:8]} != HEAD {head[:8]}", file=sys.stderr); sys.exit(1)
+passed = set(d.get("pass", []))
+missing = [p for p in required if p not in passed]
+if missing:
+    print(f"required phases not passed: {', '.join(missing)}", file=sys.stderr); sys.exit(1)
+sys.exit(0)
+PY
+
+echo "✓ pre-push: e2e green for HEAD ${head_sha:0:8} — push allowed."
+exit 0
